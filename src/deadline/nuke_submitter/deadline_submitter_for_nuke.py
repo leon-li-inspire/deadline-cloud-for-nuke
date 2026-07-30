@@ -2,14 +2,13 @@
 
 from __future__ import annotations
 
-import os
-import re
 from pathlib import Path
 from typing import Any, Optional
 
 import nuke
 import yaml  # type: ignore[import]
 from deadline.client.api import get_deadline_cloud_library_telemetry_client
+from deadline.client.config import get_setting, str2bool
 from deadline.client.job_bundle import deadline_yaml_dump
 from deadline.client.ui import gui_error_handler
 import deadline.nuke_submitter.copycat_adaptor as copycat_adaptor_module
@@ -17,9 +16,12 @@ from deadline.client.ui.dialogs.submit_job_to_deadline_dialog import (  # type: 
     JobBundlePurpose,
     SubmitJobToDeadlineDialog,
 )
-from nuke import Node
-
-from deadline.nuke_util import ocio as nuke_ocio
+from deadline.client.ui.pre_gui_hooks import (  # type: ignore
+    PreGuiHookContext,
+    apply_pre_gui_output,
+    qt_hook_confirmation,
+    run_pre_gui_hooks,
+)
 
 # Handle different Qt imports for different Nuke versions
 try:
@@ -35,14 +37,13 @@ except ImportError:
         QMessageBox,
     )
 
-from deadline.client.exceptions import DeadlineOperationError
+from deadline.client.exceptions import DeadlineOperationCanceled, DeadlineOperationError
 from deadline.client.job_bundle.submission import AssetReferences
 
 from ._version import version
 from ._version import version_tuple as adaptor_version_tuple
 from .update_utils import check_and_show_update_dialog
 from .assets import (
-    find_all_write_nodes,
     get_nuke_script_file,
     get_scene_asset_references,
 )
@@ -51,6 +52,11 @@ from .data_classes import (
     RenderSettings,
     CopyCatTrainingSettings,
     SubmitterUISettings,
+)
+from .submitter import (
+    NukeSubmitter,
+    NukeSubmitterSettings,
+    _set_timeouts,
 )
 from .ui.components.asset_scan_warning_dialog import AssetScanWarningDialog
 from .ui.components.scene_settings_tab import SceneSettingsWidget
@@ -70,110 +76,53 @@ def show_nuke_render_submitter(job_type: JobType) -> Optional[SubmitJobToDeadlin
         return _show_nuke_render_submitter(mainwin, job_type=job_type, f=Qt.Tool)
 
 
-def _get_write_node(settings: SubmitterUISettings) -> tuple[Node, str]:
-    assert settings.get_job_type() == JobType.RENDER
+def _ui_settings_to_submitter_settings(
+    ui_settings: SubmitterUISettings,
+) -> NukeSubmitterSettings:
+    """Adapt the GUI's RENDER SubmitterUISettings to the headless NukeSubmitterSettings.
 
-    if settings.jobtype_specific_settings.write_node_selection:  # type: ignore[union-attr]
-        write_node = nuke.toNode(settings.jobtype_specific_settings.write_node_selection)  # type: ignore[union-attr]
-    else:
-        write_node = nuke.root()
-    return write_node, settings.jobtype_specific_settings.write_node_selection  # type: ignore[union-attr]
+    The mirror of the old ``_to_native_settings`` (now inverted): the render
+    builders consume :class:`NukeSubmitterSettings` directly, so the GUI settings
+    are converted at the submission boundary. ``name`` -> ``job_name``; the
+    render-specific fields live on ``jobtype_specific_settings`` (a
+    ``RenderSettings``) and are flattened onto the unified settings.
 
-
-def _set_timeouts(template: dict[str, Any], settings: SubmitterUISettings) -> None:
+    Only valid for RENDER submissions — CopyCat training keeps its own path.
     """
-    Timeouts are an OpenJD field applicable to actions but for specification 2023-09, timeouts must
-    be hard-coded in the job template. There are three types of actions: OnRun, onEnter, and onExit.
-    This function does an in-place modification of timeout values for each action in the template.
-    """
-
-    def _handle_environment(environment: dict):
-        if "script" in environment:
-            actions = environment["script"]["actions"]
-            actions["onEnter"]["timeout"] = settings.on_enter_timeout_seconds
-            if "onExit" in actions:
-                actions["onExit"]["timeout"] = settings.on_exit_timeout_seconds
-
-    def _handle_step(step: dict):
-        for environment in step.get("stepEnvironments", []):
-            _handle_environment(environment)
-
-        step["script"]["actions"]["onRun"]["timeout"] = settings.on_run_timeout_seconds
-
-    for environment in template.get("jobEnvironments", []):
-        _handle_environment(environment)
-
-    for step in template.get("steps", []):
-        _handle_step(step)
-
-
-def _remove_gizmo_dir_from_job_template(job_template: dict[str, Any]) -> None:
-    for index, param in enumerate(job_template["parameterDefinitions"]):
-        if param["name"] == "GizmoDir":
-            job_template["parameterDefinitions"].pop(index)
-            break
-
-
-def _add_gizmo_dir_to_job_template(job_template: dict[str, Any]) -> None:
-    if "jobEnvironments" not in job_template:
-        job_template["jobEnvironments"] = []
-
-    # This needs to be prepended rather than appended
-    # as it must run before the "Nuke" environment.
-    job_template["jobEnvironments"].insert(
-        0,
-        {
-            "name": "Add Gizmos to NUKE_PATH",
-            "script": {
-                "actions": {"onEnter": {"command": "{{Env.File.Enter}}"}},
-                "embeddedFiles": [
-                    {
-                        "name": "Enter",
-                        "type": "TEXT",
-                        "runnable": True,
-                        "data": """#!/bin/bash
-    echo 'openjd_env: NUKE_PATH=$NUKE_PATH:{{Param.GizmoDir}}'
-    """,
-                    }
-                ],
-            },
-        },
+    render = ui_settings.jobtype_specific_settings
+    assert isinstance(render, RenderSettings)
+    return NukeSubmitterSettings(
+        job_name=ui_settings.name,
+        description=ui_settings.description,
+        frame_list=render.frame_list,
+        override_frame_range=render.override_frame_range,
+        input_filenames=list(ui_settings.input_filenames),
+        input_directories=list(ui_settings.input_directories),
+        output_directories=list(ui_settings.output_directories),
+        write_node_selection=render.write_node_selection,
+        view_selection=render.view_selection,
+        is_proxy_mode=render.is_proxy_mode,
+        continue_on_error=render.continue_on_error,
+        chunk_size=render.chunk_size,
+        target_chunk_duration=render.target_chunk_duration,
+        include_gizmos_in_job_bundle=ui_settings.include_gizmos_in_job_bundle,
+        include_adaptor_wheels=ui_settings.include_adaptor_wheels,
+        timeouts_enabled=ui_settings.timeouts_enabled,
+        on_run_timeout_seconds=ui_settings.on_run_timeout_seconds,
+        on_enter_timeout_seconds=ui_settings.on_enter_timeout_seconds,
+        on_exit_timeout_seconds=ui_settings.on_exit_timeout_seconds,
     )
 
 
-def _add_ocio_path_to_job_template(job_template: dict[str, Any]) -> None:
-    if "jobEnvironments" not in job_template:
-        job_template["jobEnvironments"] = []
+def _get_copycat_job_template(settings: SubmitterUISettings) -> dict[str, Any]:
+    """Build the OpenJD job template for a CopyCat training submission.
 
-    # This needs to be prepended rather than appended
-    # as it must run before the "Nuke" environment.
-    job_template["jobEnvironments"].insert(
-        0,
-        {
-            "name": "Add OCIO Path to Environment Variable",
-            "variables": {"OCIO": "{{Param.OCIOConfigPath}}"},
-        },
-    )
-
-
-def _remove_ocio_path_from_job_template(job_template: dict[str, Any]) -> None:
-    for index, param in enumerate(job_template["parameterDefinitions"]):
-        if param["name"] == "OCIOConfigPath":
-            job_template["parameterDefinitions"].pop(index)
-            break
-
-
-def _get_job_template(settings: SubmitterUISettings) -> dict[str, Any]:
-    job_type = settings.get_job_type()
-    # Load the default Nuke job template, and then fill in scene-specific
-    # values it needs.
-
-    if job_type == JobType.RENDER:
-        template_name = "default_nuke_job_template.yaml"
-    else:
-        template_name = "copycat_job_template.yaml"
-
-    with open(Path(__file__).parent / template_name) as f:
+    CopyCat training is a GUI-only job type and is not expressed through the
+    unified NukeSubmitter (which is render-only), so its small template builder
+    stays here. Timeout patching is shared with the render engine via
+    ``_set_timeouts``.
+    """
+    with open(Path(__file__).parent / "copycat_job_template.yaml") as f:
         job_template = yaml.safe_load(f)
 
     # Set the job's name and description
@@ -184,114 +133,7 @@ def _get_job_template(settings: SubmitterUISettings) -> dict[str, Any]:
     # Set the timeouts for each action:
     _set_timeouts(job_template, settings)
 
-    if job_type == JobType.RENDER:
-        # Add Gizmo directory to NUKE_PATH if we copied
-        # any gizmos to the job bundle.
-        if settings.include_gizmos_in_job_bundle:
-            _add_gizmo_dir_to_job_template(job_template)
-        else:
-            _remove_gizmo_dir_from_job_template(job_template)
-
-        # Get a map of the parameter definitions for easier lookup
-        parameter_def_map = {param["name"]: param for param in job_template["parameterDefinitions"]}
-
-        # Set the WriteNode parameter allowed values
-        parameter_def_map["WriteNode"]["allowedValues"].extend(
-            sorted(node.fullName() for node in find_all_write_nodes())
-        )
-
-        # Set the View parameter allowed values
-        parameter_def_map["View"]["allowedValues"] = ["All Views"] + sorted(nuke.views())
-
-        # if OCIO is disabled, remove OCIO path from the template
-        if nuke_ocio.is_OCIO_enabled():
-            _add_ocio_path_to_job_template(job_template)
-        else:
-            _remove_ocio_path_from_job_template(job_template)
-
-        # If this developer option is enabled, merge the adaptor_override_environment
-        if settings.include_adaptor_wheels:
-            with open(Path(__file__).parent / "adaptor_override_environment.yaml") as f:
-                override_environment = yaml.safe_load(f)
-
-            # Read DEVELOPMENT.md for instructions to create the wheels directory.
-            wheels_path = Path(__file__).parent.parent.parent.parent / "wheels"
-            if not wheels_path.is_dir():
-                raise RuntimeError(
-                    "The Developer Option 'Include Adaptor Wheels' is enabled, but the wheels directory does not exist:\n"
-                    + str(wheels_path)
-                )
-            wheels_path_package_names = {
-                path.split("-", 1)[0] for path in os.listdir(wheels_path) if path.endswith(".whl")
-            }
-            if wheels_path_package_names != {
-                "openjd_adaptor_runtime",
-                "deadline",
-                "deadline_cloud_for_nuke",
-            }:
-                raise RuntimeError(
-                    "The Developer Option 'Include Adaptor Wheels' is enabled, but the wheels directory contains the wrong wheels:\n"
-                    + "Expected: openjd_adaptor_runtime, deadline, and deadline_cloud_for_nuke\n"
-                    + f"Actual: {wheels_path_package_names}"
-                )
-
-            override_adaptor_name_param = [
-                param
-                for param in override_environment["parameterDefinitions"]
-                if param["name"] == "OverrideAdaptorName"
-            ][0]
-            override_adaptor_name_param["default"] = "NukeAdaptor"
-
-            # There are no parameter conflicts between these two templates, so this works
-            job_template["parameterDefinitions"].extend(
-                override_environment["parameterDefinitions"]
-            )
-
-            # Add the environment to the end of the template's job environments
-            if "jobEnvironments" not in job_template:
-                job_template["jobEnvironments"] = []
-            job_template["jobEnvironments"].append(override_environment["environment"])
-
-        # Determine whether this is a movie render. If it is, we want to ensure that the entire Nuke
-        # evaluation is placed on one task.
-        write_node, write_node_name = _get_write_node(settings)
-        movie_render = "file_type" in write_node.knobs() and write_node["file_type"].value() in [
-            "mov",
-            "mxf",
-        ]
-        if movie_render:
-            frame_list = _get_frame_list(settings, write_node, write_node_name)
-            match = re.match(r"(\d+)-(\d+)", frame_list)
-            if not match:
-                raise DeadlineOperationError(
-                    f"Invalid frame range {frame_list} for evaluating a MOV render. Frame range must follow the format 'startFrame - endFrame'"
-                )
-
-            start_frame = match.group(1)
-            end_frame = match.group(2)
-
-            # Remove the Frame parameter space and update the script data with the desired start and end frame
-            for step in job_template["steps"]:
-                del step["parameterSpace"]
-                step["script"]["embeddedFiles"][0][
-                    "data"
-                ] = f"frameRange: {start_frame}-{end_frame}\n"
-
     return job_template
-
-
-def _get_parameter_values(
-    settings: SubmitterUISettings,
-    queue_parameters: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    job_type = settings.get_job_type()
-
-    if job_type == JobType.RENDER:
-        return _get_render_parameter_values(settings=settings, queue_parameters=queue_parameters)
-    else:
-        return _get_copycat_training_parameter_values(
-            settings=settings, queue_parameters=queue_parameters
-        )
 
 
 def _get_copycat_training_parameter_values(
@@ -324,138 +166,21 @@ def _get_copycat_training_parameter_values(
     return parameter_values
 
 
-def _get_render_parameter_values(
-    settings: SubmitterUISettings,
-    queue_parameters: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    parameter_values: list[dict[str, Any]] = []
+def _pre_gui_hook_confirm_callback(parent):
+    """Choose the confirmation callback for pre-GUI hooks based on the auto_accept setting.
 
-    write_node, write_node_name = _get_write_node(settings)
-
-    # Set the Frames parameter value
-    parameter_values.append(
-        {"name": "Frames", "value": _get_frame_list(settings, write_node, write_node_name)}
-    )
-
-    # Set the Nuke script file value
-    parameter_values.append({"name": "NukeScriptFile", "value": get_nuke_script_file()})
-
-    # Set the WriteNode parameter value
-    if write_node_name:
-        parameter_values.append({"name": "WriteNode", "value": write_node_name})
-
-    # Set the View parameter value
-    if settings.jobtype_specific_settings.view_selection:  # type: ignore[union-attr]
-        parameter_values.append(
-            {"name": "View", "value": settings.jobtype_specific_settings.view_selection}  # type: ignore[union-attr]
-        )
-
-    # Set the ProxyMode parameter default
-    parameter_values.append(
-        {
-            "name": "ProxyMode",
-            "value": "true" if settings.jobtype_specific_settings.is_proxy_mode else "false",  # type: ignore[union-attr]
-        }
-    )
-
-    # Set the ContinueOnError parameter default
-    parameter_values.append(
-        {
-            "name": "ContinueOnError",
-            "value": "true" if settings.jobtype_specific_settings.continue_on_error else "false",  # type: ignore[union-attr]
-        }
-    )
-
-    # Set chunking parameter values
-    parameter_values.append(
-        {
-            "name": "ChunkSize",
-            "value": settings.jobtype_specific_settings.chunk_size,  # type: ignore[union-attr]
-        }
-    )
-    parameter_values.append(
-        {
-            "name": "TargetChunkDuration",
-            "value": settings.jobtype_specific_settings.target_chunk_duration,  # type: ignore[union-attr]
-        }
-    )
-
-    # Set the OCIO config path value
-    if nuke_ocio.is_OCIO_enabled():
-        ocio_config_path = nuke_ocio.get_ocio_config_path()
-        if ocio_config_path:
-            parameter_values.append({"name": "OCIOConfigPath", "value": ocio_config_path})
-        else:
-            raise DeadlineOperationError(
-                "OCIO is enabled but OCIO config file is not specified. Please check and update the config file before proceeding."
-            )
-    if settings.include_adaptor_wheels:
-        wheels_path = str(Path(__file__).parent.parent.parent.parent / "wheels")
-        parameter_values.append({"name": "AdaptorWheels", "value": wheels_path})
-
-    # Check for any overlap between the job parameters we've defined and the
-    # queue parameters. This is an error, as we weren't synchronizing the values
-    # between the two different tabs where they came from.
-    parameter_names = {param["name"] for param in parameter_values}
-    queue_parameter_names = {param["name"] for param in queue_parameters}
-    parameter_overlap = parameter_names.intersection(queue_parameter_names)
-    if parameter_overlap:
-        raise DeadlineOperationError(
-            "The following queue parameters conflict with the Nuke job parameters:\n"
-            f"{', '.join(parameter_overlap)}"
-        )
-
-    # If we're overriding the adaptor with wheels, remove the adaptor from the Packages parameters
-    if settings.include_adaptor_wheels:
-        rez_param = {}
-        conda_param = {}
-        # Find the Packages parameter definition
-        for param in queue_parameters:
-            if param["name"] == "RezPackages":
-                rez_param = param
-            if param["name"] == "CondaPackages":
-                conda_param = param
-        # Remove the deadline_cloud_for_nuke/nuke-openjd package
-        if rez_param:
-            rez_param["value"] = " ".join(
-                pkg
-                for pkg in rez_param["value"].split()
-                if not pkg.startswith("deadline_cloud_for_nuke")
-            )
-        if conda_param:
-            conda_param["value"] = " ".join(
-                pkg for pkg in conda_param["value"].split() if not pkg.startswith("nuke-openjd")
-            )
-
-    parameter_values.extend(
-        {"name": param["name"], "value": param["value"]} for param in queue_parameters
-    )
-
-    return parameter_values
-
-
-def _get_frame_list(
-    settings: SubmitterUISettings,
-    write_node: Node,
-    write_node_name: Optional[str],
-) -> str:
-    assert settings.get_job_type() == JobType.RENDER
-    # Set the Frames parameter value
-    if settings.jobtype_specific_settings.override_frame_range:  # type: ignore[union-attr]
-        frame_list = settings.jobtype_specific_settings.frame_list  # type: ignore[union-attr]
-    else:
-        # frame range from project setting
-        frame_list = str(nuke.root().frameRange())
-        if write_node_name and write_node.knob("use_limit").value():
-            first_frame = int(write_node.knob("first").value())
-            last_frame = int(write_node.knob("last").value())
-            frame_list = f"{first_frame}-{last_frame}"
-    return frame_list
+    Returns ``None`` (run hooks without prompting) when ``settings.auto_accept`` is enabled,
+    otherwise the standard Qt confirmation dialog from ``qt_hook_confirmation``. Kept as a small
+    helper so the auto_accept branch can be unit-tested headlessly.
+    """
+    if str2bool(get_setting("settings.auto_accept")):
+        return None
+    return qt_hook_confirmation(parent)
 
 
 def _show_nuke_render_submitter(
     parent, job_type: JobType, f=Qt.WindowFlags()
-) -> SubmitJobToDeadlineDialog:
+) -> Optional[SubmitJobToDeadlineDialog]:
     global g_render_submitter_dialog
     global g_copycat_submitter_dialog
     # Initialize telemetry client, opt-out is respected
@@ -530,15 +255,23 @@ def _show_nuke_render_submitter(
                 raise DeadlineOperationError(message)
 
         job_bundle_path = Path(job_bundle_dir)
-        job_template = _get_job_template(settings)
 
-        # If "HostRequirements" is provided, inject it into each of the "Step"
-        if host_requirements:
-            # for each step in the template, append the same host requirements.
-            for step in job_template["steps"]:
-                step["hostRequirements"] = host_requirements
-
-        parameter_values = _get_parameter_values(settings, queue_parameters)
+        # Render goes through the unified NukeSubmitter engine, so the GUI and
+        # the headless API build the render bundle through one code path.
+        # CopyCat training is GUI-only and keeps its own small builder.
+        if settings.get_job_type() == JobType.RENDER:
+            submitter = NukeSubmitter()
+            nuke_settings = _ui_settings_to_submitter_settings(settings)
+            # get_job_template injects host_requirements into every step.
+            job_template = submitter.get_job_template(nuke_settings, host_requirements)
+            parameter_values = submitter.get_parameter_values(nuke_settings, queue_parameters)
+        else:
+            job_template = _get_copycat_job_template(settings)
+            # If "HostRequirements" is provided, inject it into each of the "Step"
+            if host_requirements:
+                for step in job_template["steps"]:
+                    step["hostRequirements"] = host_requirements
+            parameter_values = _get_copycat_training_parameter_values(settings, queue_parameters)
 
         with open(job_bundle_path / "template.yaml", "w", encoding="utf8") as f:
             deadline_yaml_dump(job_template, f, indent=1)
@@ -595,19 +328,53 @@ def _show_nuke_render_submitter(
         if job_type == JobType.RENDER:
             conda_packages += f" nuke-openjd={adaptor_version}.*"
 
+        shared_parameter_values = {
+            "RezPackages": rez_packages,
+            "CondaPackages": conda_packages,
+        }
+
+        # Run pre-GUI hooks so studios can pre-populate dialog fields before it opens. Nuke has
+        # no on-disk job bundle at this point, so hooks are sourced from DEADLINE_HOOKS_DIR only
+        # (bundle_dir=None), gated by settings.allow_environment_hooks. The confirmation prompt is
+        # skipped when auto_accept is set; otherwise the standard dialog is shown.
+        #
+        # This runs once per Nuke session, on first open: the dialog is cached in the
+        # g_*_submitter_dialog globals and reused via refresh() on later opens (see the else
+        # branch below), so hooks are not re-run on every open. This is intentional and mirrors
+        # the Maya submitter; re-running hooks per open would require threading the merged
+        # parameters through refresh(), which does not accept initial_shared_parameter_values.
+        try:
+            pre_gui_output = run_pre_gui_hooks(
+                PreGuiHookContext(
+                    bundle_dir=None,
+                    job_name=render_settings.name,
+                    submitter_name="nuke",
+                    parameters=dict(shared_parameter_values),
+                ),
+                confirm_callback=_pre_gui_hook_confirm_callback(parent),
+            )
+        except DeadlineOperationCanceled:
+            # The user declined the hook confirmation prompt. This is a normal cancellation, not
+            # an error, so abort opening the dialog silently. Without this, the exception would
+            # propagate to the outer gui_error_handler and surface a spurious "Error opening AWS
+            # Deadline Cloud Submitter" dialog for what is a deliberate "No" click.
+            return None
+        # run_pre_gui_hooks returns {} when no hooks run and raises DeadlineOperationCanceled if
+        # the user declines; `or {}` is defensive against any future contract change so the
+        # common no-hooks path can never pass a falsy value into apply_pre_gui_output.
+        apply_pre_gui_output(pre_gui_output or {}, render_settings, shared_parameter_values)
+
         submitter_dialog = SubmitJobToDeadlineDialog(
             job_setup_widget_type=SceneSettingsWidget,
             initial_job_settings=render_settings,
-            initial_shared_parameter_values={
-                "RezPackages": rez_packages,
-                "CondaPackages": conda_packages,
-            },
+            initial_shared_parameter_values=shared_parameter_values,
             auto_detected_attachments=asset_references_parsing_outcome.asset_references,
             attachments=attachments,
             on_create_job_bundle_callback=on_create_job_bundle_callback,  # type: ignore
             parent=parent,
             f=f,
             show_host_requirements_tab=True,
+            use_deadline_cloud_v2_channel=True,
         )
 
         if job_type == JobType.RENDER:
